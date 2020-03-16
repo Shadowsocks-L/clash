@@ -4,33 +4,25 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"math/rand"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Dreamacro/clash/common/cache"
 	"github.com/Dreamacro/clash/common/picker"
 	"github.com/Dreamacro/clash/component/fakeip"
-	C "github.com/Dreamacro/clash/constant"
+	"github.com/Dreamacro/clash/component/resolver"
 
 	D "github.com/miekg/dns"
-	geoip2 "github.com/oschwald/geoip2-golang"
-)
-
-var (
-	// DefaultResolver aim to resolve ip with host
-	DefaultResolver *Resolver
+	"golang.org/x/sync/singleflight"
 )
 
 var (
 	globalSessionCache = tls.NewLRUClientSessionCache(64)
-
-	mmdb *geoip2.Reader
-	once sync.Once
 )
 
-type resolver interface {
+type dnsClient interface {
 	Exchange(m *D.Msg) (msg *D.Msg, err error)
 	ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error)
 }
@@ -41,43 +33,37 @@ type result struct {
 }
 
 type Resolver struct {
-	ipv6     bool
-	mapping  bool
-	fakeip   bool
-	pool     *fakeip.Pool
-	fallback []resolver
-	main     []resolver
-	cache    *cache.Cache
+	ipv6            bool
+	mapping         bool
+	fakeip          bool
+	pool            *fakeip.Pool
+	main            []dnsClient
+	fallback        []dnsClient
+	fallbackFilters []fallbackFilter
+	group           singleflight.Group
+	cache           *cache.Cache
 }
 
-// ResolveIP request with TypeA and TypeAAAA, priority return TypeAAAA
+// ResolveIP request with TypeA and TypeAAAA, priority return TypeA
 func (r *Resolver) ResolveIP(host string) (ip net.IP, err error) {
-	ip = net.ParseIP(host)
-	if ip != nil {
-		return ip, nil
-	}
-
-	ch := make(chan net.IP)
+	ch := make(chan net.IP, 1)
 	go func() {
 		defer close(ch)
-		ip, err := r.resolveIP(host, D.TypeA)
+		ip, err := r.resolveIP(host, D.TypeAAAA)
 		if err != nil {
 			return
 		}
 		ch <- ip
 	}()
 
-	ip, err = r.resolveIP(host, D.TypeAAAA)
+	ip, err = r.resolveIP(host, D.TypeA)
 	if err == nil {
-		go func() {
-			<-ch
-		}()
 		return
 	}
 
 	ip, open := <-ch
 	if !open {
-		return nil, errIPNotFound
+		return nil, resolver.ErrIPNotFound
 	}
 
 	return ip, nil
@@ -85,26 +71,21 @@ func (r *Resolver) ResolveIP(host string) (ip net.IP, err error) {
 
 // ResolveIPv4 request with TypeA
 func (r *Resolver) ResolveIPv4(host string) (ip net.IP, err error) {
-	ip = net.ParseIP(host)
-	if ip != nil {
-		return ip, nil
+	return r.resolveIP(host, D.TypeA)
+}
+
+// ResolveIPv6 request with TypeAAAA
+func (r *Resolver) ResolveIPv6(host string) (ip net.IP, err error) {
+	return r.resolveIP(host, D.TypeAAAA)
+}
+
+func (r *Resolver) shouldFallback(ip net.IP) bool {
+	for _, filter := range r.fallbackFilters {
+		if filter.Match(ip) {
+			return true
+		}
 	}
-
-	query := &D.Msg{}
-	query.SetQuestion(D.Fqdn(host), D.TypeA)
-
-	msg, err := r.Exchange(query)
-	if err != nil {
-		return nil, err
-	}
-
-	ips := r.msgToIP(msg)
-	if len(ips) == 0 {
-		return nil, errIPNotFound
-	}
-
-	ip = ips[0]
-	return
+	return false
 }
 
 // Exchange a batch of dns request, and it use cache
@@ -134,18 +115,29 @@ func (r *Resolver) Exchange(m *D.Msg) (msg *D.Msg, err error) {
 		}
 	}()
 
-	isIPReq := isIPRequest(q)
-	if isIPReq {
-		msg, err = r.fallbackExchange(m)
-		return
+	ret, err, _ := r.group.Do(q.String(), func() (interface{}, error) {
+		isIPReq := isIPRequest(q)
+		if isIPReq {
+			msg, err := r.fallbackExchange(m)
+			return msg, err
+		}
+
+		return r.batchExchange(r.main, m)
+	})
+
+	if err == nil {
+		msg = ret.(*D.Msg)
 	}
 
-	msg, err = r.batchExchange(r.main, m)
 	return
 }
 
 // IPToHost return fake-ip or redir-host mapping host
 func (r *Resolver) IPToHost(ip net.IP) (string, bool) {
+	if r.fakeip {
+		return r.pool.LookBack(ip)
+	}
+
 	cache := r.cache.Get(ip.String())
 	if cache == nil {
 		return "", false
@@ -158,37 +150,30 @@ func (r *Resolver) IsMapping() bool {
 	return r.mapping
 }
 
-func (r *Resolver) IsFakeIP() bool {
+// FakeIPEnabled returns if fake-ip is enabled
+func (r *Resolver) FakeIPEnabled() bool {
 	return r.fakeip
 }
 
-func (r *Resolver) batchExchange(clients []resolver, m *D.Msg) (msg *D.Msg, err error) {
-	in := make(chan interface{})
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	fast := picker.SelectFast(ctx, in)
+// IsFakeIP determine if given ip is a fake-ip
+func (r *Resolver) IsFakeIP(ip net.IP) bool {
+	if r.FakeIPEnabled() {
+		return r.pool.Exist(ip)
+	}
+	return false
+}
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(clients))
-	for _, r := range clients {
-		go func(r resolver) {
-			defer wg.Done()
-			msg, err := r.ExchangeContext(ctx, m)
-			if err != nil || msg.Rcode != D.RcodeSuccess {
-				return
-			}
-			in <- msg
-		}(r)
+func (r *Resolver) batchExchange(clients []dnsClient, m *D.Msg) (msg *D.Msg, err error) {
+	fast, ctx := picker.WithTimeout(context.Background(), time.Second*5)
+	for _, client := range clients {
+		r := client
+		fast.Go(func() (interface{}, error) {
+			return r.ExchangeContext(ctx, m)
+		})
 	}
 
-	// release in channel
-	go func() {
-		wg.Wait()
-		close(in)
-	}()
-
-	elm, exist := <-fast
-	if !exist {
+	elm := fast.Wait()
+	if elm == nil {
 		return nil, errors.New("All DNS requests failed")
 	}
 
@@ -206,13 +191,8 @@ func (r *Resolver) fallbackExchange(m *D.Msg) (msg *D.Msg, err error) {
 	fallbackMsg := r.asyncExchange(r.fallback, m)
 	res := <-msgCh
 	if res.Error == nil {
-		if mmdb == nil {
-			return nil, errors.New("GeoIP cannot use")
-		}
-
 		if ips := r.msgToIP(res.Msg); len(ips) != 0 {
-			if record, _ := mmdb.Country(ips[0]); record.Country.IsoCode == "CN" || record.Country.IsoCode == "" {
-				// release channel
+			if r.shouldFallback(ips[0]) {
 				go func() { <-fallbackMsg }()
 				msg = res.Msg
 				return msg, err
@@ -226,6 +206,18 @@ func (r *Resolver) fallbackExchange(m *D.Msg) (msg *D.Msg, err error) {
 }
 
 func (r *Resolver) resolveIP(host string, dnsType uint16) (ip net.IP, err error) {
+	ip = net.ParseIP(host)
+	if ip != nil {
+		isIPv4 := ip.To4() != nil
+		if dnsType == D.TypeAAAA && !isIPv4 {
+			return ip, nil
+		} else if dnsType == D.TypeA && isIPv4 {
+			return ip, nil
+		} else {
+			return nil, resolver.ErrIPVersion
+		}
+	}
+
 	query := &D.Msg{}
 	query.SetQuestion(D.Fqdn(host), dnsType)
 
@@ -235,11 +227,12 @@ func (r *Resolver) resolveIP(host string, dnsType uint16) (ip net.IP, err error)
 	}
 
 	ips := r.msgToIP(msg)
-	if len(ips) == 0 {
-		return nil, errIPNotFound
+	ipLength := len(ips)
+	if ipLength == 0 {
+		return nil, resolver.ErrIPNotFound
 	}
 
-	ip = ips[0]
+	ip = ips[rand.Intn(ipLength)]
 	return
 }
 
@@ -258,7 +251,7 @@ func (r *Resolver) msgToIP(msg *D.Msg) []net.IP {
 	return ips
 }
 
-func (r *Resolver) asyncExchange(client []resolver, msg *D.Msg) <-chan *result {
+func (r *Resolver) asyncExchange(client []dnsClient, msg *D.Msg) <-chan *result {
 	ch := make(chan *result)
 	go func() {
 		res, err := r.batchExchange(client, msg)
@@ -272,28 +265,47 @@ type NameServer struct {
 	Addr string
 }
 
+type FallbackFilter struct {
+	GeoIP  bool
+	IPCIDR []*net.IPNet
+}
+
 type Config struct {
 	Main, Fallback []NameServer
+	Default        []NameServer
 	IPv6           bool
 	EnhancedMode   EnhancedMode
+	FallbackFilter FallbackFilter
 	Pool           *fakeip.Pool
 }
 
 func New(config Config) *Resolver {
-	once.Do(func() {
-		mmdb, _ = geoip2.Open(C.Path.MMDB())
-	})
+	defaultResolver := &Resolver{
+		main:  transform(config.Default, nil),
+		cache: cache.New(time.Second * 60),
+	}
 
 	r := &Resolver{
 		ipv6:    config.IPv6,
-		main:    transform(config.Main),
+		main:    transform(config.Main, defaultResolver),
 		cache:   cache.New(time.Second * 60),
 		mapping: config.EnhancedMode == MAPPING,
 		fakeip:  config.EnhancedMode == FAKEIP,
 		pool:    config.Pool,
 	}
+
 	if len(config.Fallback) != 0 {
-		r.fallback = transform(config.Fallback)
+		r.fallback = transform(config.Fallback, defaultResolver)
 	}
+
+	fallbackFilters := []fallbackFilter{}
+	if config.FallbackFilter.GeoIP {
+		fallbackFilters = append(fallbackFilters, &geoipFilter{})
+	}
+	for _, ipnet := range config.FallbackFilter.IPCIDR {
+		fallbackFilters = append(fallbackFilters, &ipnetFilter{ipnet: ipnet})
+	}
+	r.fallbackFilters = fallbackFilters
+
 	return r
 }

@@ -1,4 +1,4 @@
-package adapters
+package outbound
 
 import (
 	"bytes"
@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dreamacro/clash/component/resolver"
 	"github.com/Dreamacro/clash/component/socks5"
 	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/dns"
 )
 
 const (
@@ -32,11 +32,12 @@ func urlToMetadata(rawURL string) (addr C.Metadata, err error) {
 
 	port := u.Port()
 	if port == "" {
-		if u.Scheme == "https" {
+		switch u.Scheme {
+		case "https":
 			port = "443"
-		} else if u.Scheme == "http" {
+		case "http":
 			port = "80"
-		} else {
+		default:
 			err = fmt.Errorf("%s scheme not Support", rawURL)
 			return
 		}
@@ -85,40 +86,13 @@ func serializesSocksAddr(metadata *C.Metadata) []byte {
 	return bytes.Join(buf, nil)
 }
 
-type fakeUDPConn struct {
-	net.Conn
-}
-
-func (fuc *fakeUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
-	return fuc.Conn.Write(b)
-}
-
-func (fuc *fakeUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	n, err := fuc.Conn.Read(b)
-	return n, fuc.RemoteAddr(), err
-}
-
-func dialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
-	}
-
-	ip, err := dns.ResolveIP(host)
-	if err != nil {
-		return nil, err
-	}
-
-	return net.DialTimeout(network, net.JoinHostPort(ip.String(), port), timeout)
-}
-
 func resolveUDPAddr(network, address string) (*net.UDPAddr, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
 	}
 
-	ip, err := dns.ResolveIP(host)
+	ip, err := resolver.ResolveIP(host)
 	if err != nil {
 		return nil, err
 	}
